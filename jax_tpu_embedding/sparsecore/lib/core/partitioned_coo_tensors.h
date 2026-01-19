@@ -18,9 +18,7 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
-#include <iterator>
 #include <limits>
-#include <utility>
 #include <vector>
 
 #include "absl/algorithm/container.h"  // from @com_google_absl
@@ -34,23 +32,21 @@ namespace jax_sc_embedding {
 
 class PartitionedCooTensors {
  public:
-  PartitionedCooTensors() : PartitionedCooTensors(0, 0, 0, 1) {}
-  PartitionedCooTensors(int reserve_count, int num_sc_per_device,
-                        uint32_t global_sc_count, int bucket_count_per_sc = 1)
+  PartitionedCooTensors() : PartitionedCooTensors(0, 1) {}
+  PartitionedCooTensors(uint32_t global_sc_count, int bucket_count_per_sc = 1)
       : coo_tensors_(),
         bucket_count_per_sc_(bucket_count_per_sc),
-        num_sc_per_device_(num_sc_per_device),
         global_sc_count_(global_sc_count),
         bucket_offsets_(),
-        curr_sc_id_(0),
         curr_bucket_id_(0),
         merged_(false),
         dedup_col_id_(std::numeric_limits<uint32_t>::max()),
         dedup_row_id_(std::numeric_limits<uint32_t>::max()) {
-    coo_tensors_.reserve(reserve_count);
-    bucket_offsets_.reserve(1 + num_sc_per_device * bucket_count_per_sc_);
+    bucket_offsets_.reserve(1 + bucket_count_per_sc_);
     bucket_offsets_.push_back(0);
   }
+
+  void Reserve(int reserve_count) { coo_tensors_.reserve(reserve_count); }
 
   inline void MergeWithLastCoo(const CooFormat& coo_tensor) {
     DCHECK_GT(coo_tensors_.size(), 0);
@@ -73,15 +69,9 @@ class PartitionedCooTensors {
     return false;
   }
 
-  void ResetDedupState() {
-    dedup_col_id_ = std::numeric_limits<uint32_t>::max();
-    dedup_row_id_ = std::numeric_limits<uint32_t>::max();
-  }
-
   // Add Coo tensor for given SC and bucket. Similar to std::vector::push_back.
-  void Add(int target_sc_id, int target_bucket_id,
-           const CooFormat& coo_tensor) {
-    AdvanceBucketOffsets(target_sc_id, target_bucket_id);
+  void Add(int target_bucket_id, const CooFormat& coo_tensor) {
+    AdvanceBucketOffsets(target_bucket_id);
 
     coo_tensors_.push_back(coo_tensor);
     dedup_col_id_ = coo_tensor.col_id;
@@ -89,10 +79,8 @@ class PartitionedCooTensors {
   }
 
   // Get size of COO tensors for given SC.
-  int Size(const int local_sc_id) const {
-    DCHECK_GE(curr_sc_id_, local_sc_id);
-
-    const int start_index = bucket_count_per_sc_ * local_sc_id;
+  int Size() const {
+    const int start_index = 0;
     const int end_index = start_index + bucket_count_per_sc_;
 
     DCHECK_LT(end_index, bucket_offsets_.size());
@@ -101,8 +89,8 @@ class PartitionedCooTensors {
   }
 
   // Get COO tensors for given SC and bucket.
-  absl::Span<const CooFormat> operator()(int local_sc_id, int bucket_id) const {
-    const int start_index = local_sc_id * bucket_count_per_sc_ + bucket_id;
+  absl::Span<const CooFormat> operator()(int bucket_id) const {
+    const int start_index = bucket_id;
     const int start_offset = bucket_offsets_[start_index];
     DCHECK_LT(start_index + 1, bucket_offsets_.size());
     const int end_offset = bucket_offsets_[start_index + 1];
@@ -113,8 +101,7 @@ class PartitionedCooTensors {
 
   // Fill remaining buckets for current SC.
   void FillRemainingScBuckets() {
-    AdvanceBucketOffsets(/* target_sc_id= */ curr_sc_id_ + 1,
-                         /* target_bucket_id= */ 0);
+    AdvanceBucketOffsets(bucket_count_per_sc_);
   }
 
   // Merge two given buckets.
@@ -132,28 +119,24 @@ class PartitionedCooTensors {
     while (j < right + subtree_size && is_bucket_merged.test(j)) {
       j++;  // Find first non-merged node in right subtree.
     }
-    for (int sc_id = 0; sc_id < num_sc_per_device_; ++sc_id) {
-      const int ptr_left = bucket_offsets_[sc_id * bucket_count_per_sc_ + i];
-      const int ptr_left_end =
-          bucket_offsets_[sc_id * bucket_count_per_sc_ + i + 1];
-      const int ptr_right = bucket_offsets_[sc_id * bucket_count_per_sc_ + j];
-      const int ptr_right_end =
-          bucket_offsets_[sc_id * bucket_count_per_sc_ + j + 1];
-      DCHECK_EQ(ptr_left_end, ptr_right) << "Must be contiguos buckets.";
-      // COOs already have same local SC and bucket, only need to compare global
-      // SC.
-      std::inplace_merge(
-          coo_tensors_.begin() + ptr_left, coo_tensors_.begin() + ptr_right,
-          coo_tensors_.begin() + ptr_right_end,
-          [&global_sc_count](const CooFormat& a, const CooFormat& b) {
-            return (a.col_id & (global_sc_count - 1)) <
-                   (b.col_id & (global_sc_count - 1));
-          });
-      // Combine into the right bucket (arbitrary choice).
-      bucket_offsets_[sc_id * bucket_count_per_sc_ + i + 1] = ptr_left;
-      bucket_offsets_[sc_id * bucket_count_per_sc_ + j] = ptr_left;
-      is_bucket_merged.set(i);
-    }
+    const int ptr_left = bucket_offsets_[i];
+    const int ptr_left_end = bucket_offsets_[i + 1];
+    const int ptr_right = bucket_offsets_[j];
+    const int ptr_right_end = bucket_offsets_[j + 1];
+    DCHECK_EQ(ptr_left_end, ptr_right) << "Must be contiguos buckets.";
+    // COOs already have same local SC and bucket, only need to compare global
+    // SC.
+    std::inplace_merge(
+        coo_tensors_.begin() + ptr_left, coo_tensors_.begin() + ptr_right,
+        coo_tensors_.begin() + ptr_right_end,
+        [&global_sc_count](const CooFormat& a, const CooFormat& b) {
+          return (a.col_id & (global_sc_count - 1)) <
+                  (b.col_id & (global_sc_count - 1));
+        });
+    // Combine into the right bucket (arbitrary choice).
+    bucket_offsets_[i + 1] = ptr_left;
+    bucket_offsets_[j] = ptr_left;
+    is_bucket_merged.set(i);
   }
 
   // Merges all buckets per SparseCore.
@@ -166,8 +149,8 @@ class PartitionedCooTensors {
   template <size_t N = CooFormat::kMaxMinibatchingBuckets>
   void Merge(std::bitset<N - 1> split) {
     CHECK(!merged_) << "Merge can only be called once.";
-    AdvanceBucketOffsets(/* target_sc_id= */ num_sc_per_device_,
-                         /* target_bucket_id= */ 0);
+    CHECK_EQ(curr_bucket_id_, bucket_count_per_sc_)
+        << "FillRemainingScBuckets() must be called before Merge().";
     DCHECK_EQ(bucket_count_per_sc_, N);
 
     DCHECK(absl::c_is_sorted(bucket_offsets_));
@@ -179,23 +162,20 @@ class PartitionedCooTensors {
 
     const int minibatches = split.count() + 1;  // N splits -> N+1 minibatches.
 
-    for (int sc_id = 0; sc_id < num_sc_per_device_; ++sc_id) {
-      const int start_pos = 1 + sc_id * bucket_count_per_sc_;
-      const int dest_pos = 1 + sc_id * minibatches;
-      for (int bucket_id = 0, minibatch_id = 0; bucket_id < N - 1;
-           ++bucket_id) {
-        if (!is_bucket_merged.test(bucket_id)) {
-          bucket_offsets_[dest_pos + minibatch_id] =
-              bucket_offsets_[start_pos + bucket_id];
-          ++minibatch_id;
-        }
+    const int start_pos = 1;
+    const int dest_pos = 1;
+    for (int bucket_id = 0, minibatch_id = 0; bucket_id < N - 1; ++bucket_id) {
+      if (!is_bucket_merged.test(bucket_id)) {
+        bucket_offsets_[dest_pos + minibatch_id] =
+            bucket_offsets_[start_pos + bucket_id];
+        ++minibatch_id;
       }
-      // SparseCore partition.
-      bucket_offsets_[dest_pos + minibatches - 1] =
-          bucket_offsets_[start_pos + bucket_count_per_sc_ - 1];
     }
+    // SparseCore partition.
+    bucket_offsets_[dest_pos + minibatches - 1] =
+        bucket_offsets_[start_pos + bucket_count_per_sc_ - 1];
 
-    bucket_offsets_.resize(1 + num_sc_per_device_ * minibatches);
+    bucket_offsets_.resize(1 + minibatches);
 
     DCHECK(absl::c_is_sorted(bucket_offsets_));
 
@@ -206,91 +186,28 @@ class PartitionedCooTensors {
   // Minibatches (after merging) or Max buckets (before merging).
   int GetNumMinibatches() const { return bucket_count_per_sc_; }
 
-  static PartitionedCooTensors MergeAll(
-      std::vector<PartitionedCooTensors>&& parts) {
-    DCHECK(!parts.empty());
-    // If there is only one part, no merging is needed.
-    if (parts.size() == 1) {
-      return std::move(parts[0]);
-    }
-    int num_sc_per_device = 0;
-    size_t total_coo_size = 0;
-    int bucket_count = parts[0].bucket_count_per_sc_;
-    uint32_t global_sc_count = parts[0].global_sc_count_;
-
-    for (const auto& part : parts) {
-      num_sc_per_device += part.num_sc_per_device_;
-      total_coo_size += part.coo_tensors_.size();
-      CHECK_EQ(part.bucket_count_per_sc_, bucket_count);
-      CHECK_EQ(part.global_sc_count_, global_sc_count);
-      // Ensure each part is fully populated/finalized.
-      // part.bucket_offsets_ should have size 1 + num_sc * bucket_count
-      CHECK_EQ(part.bucket_offsets_.size(),
-               1 + part.num_sc_per_device_ * bucket_count);
-    }
-
-    PartitionedCooTensors result(total_coo_size, num_sc_per_device,
-                                 global_sc_count, bucket_count);
-
-    size_t current_coo_offset = 0;
-
-    for (const auto& part : parts) {
-      // Append COO tensors
-      result.coo_tensors_.insert(
-          result.coo_tensors_.end(),
-          std::make_move_iterator(part.coo_tensors_.begin()),
-          std::make_move_iterator(part.coo_tensors_.end()));
-
-      // Append offsets, adjusting for the current offset.
-      // Skip the first offset (0) of each part as it corresponds to the
-      // end of the previous part (or start of 0).
-      for (size_t i = 1; i < part.bucket_offsets_.size(); ++i) {
-        result.bucket_offsets_.push_back(current_coo_offset +
-                                         part.bucket_offsets_[i]);
-      }
-      current_coo_offset += part.coo_tensors_.size();
-    }
-    // Update state variables to appear "full".
-    result.curr_sc_id_ = num_sc_per_device;
-    result.curr_bucket_id_ = 0;
-
-    return result;
-  }
-
  private:
-  // Advance bucket offsets to the given `target_sc_id` and `target_bucket_id`.
-  void AdvanceBucketOffsets(int target_sc_id, int target_bucket_id) {
-    // Every SC should have at least one ID, therefore SC Id will either be same
-    // or be the successor of current one.
-    DCHECK(target_sc_id == curr_sc_id_ + 1 || target_sc_id == curr_sc_id_);
+  // Advance bucket offsets to the given `target_bucket_id`.
+  void AdvanceBucketOffsets(int target_bucket_id) {
+    DCHECK_LT(curr_bucket_id_, bucket_count_per_sc_)
+        << "Bucket offsets already finalized.";
+    DCHECK_LE(target_bucket_id, bucket_count_per_sc_);
 
-    while (curr_sc_id_ < target_sc_id || curr_bucket_id_ < target_bucket_id) {
-      DCHECK_LT(curr_sc_id_, num_sc_per_device_);
-      DCHECK_LT(curr_bucket_id_, bucket_count_per_sc_);
+    while (curr_bucket_id_ < target_bucket_id) {
       bucket_offsets_.push_back(coo_tensors_.size());
-      if (curr_bucket_id_ == bucket_count_per_sc_ - 1) {
-        ++curr_sc_id_;
-        curr_bucket_id_ = 0;
-      } else {
-        ++curr_bucket_id_;
-      }
+      curr_bucket_id_++;
     }
-    DCHECK_EQ(curr_sc_id_, target_sc_id);
-    DCHECK_EQ(curr_bucket_id_, target_bucket_id);
   }
 
   // Flattened list of COO Tensors for all SCs.
   std::vector<CooFormat> coo_tensors_;
   // Minibatching buckets per SC.
   int bucket_count_per_sc_;
-  // Number of SCs per device.
-  int num_sc_per_device_;
   // Number of global SCs.
   uint32_t global_sc_count_;
   // Minibatching bucket offsets for all SCs (=1 for non-minibatching per SC).
   std::vector<int> bucket_offsets_;
   // Internal counters of the current SC and bucket being populated.
-  int curr_sc_id_;
   int curr_bucket_id_;
   // Merged into minibatches?
   bool merged_;
@@ -298,6 +215,45 @@ class PartitionedCooTensors {
   // dropped.
   uint32_t dedup_col_id_;
   uint32_t dedup_row_id_;
+};
+
+struct DevicePartitionedCooTensors {
+  std::vector<PartitionedCooTensors> grouped_coo_tensors;
+
+  void FillRemainingScBuckets() {
+    for (auto& grouped_coo_tensor : grouped_coo_tensors) {
+      grouped_coo_tensor.FillRemainingScBuckets();
+    }
+  }
+
+  template <size_t N = CooFormat::kMaxMinibatchingBuckets>
+  void Merge(const std::bitset<N - 1> split) {
+    for (auto& grouped_coo_tensor : grouped_coo_tensors) {
+      grouped_coo_tensor.Merge<N>(split);
+    }
+  }
+
+  void MergeAll() {
+    for (auto& grouped_coo_tensor : grouped_coo_tensors) {
+      grouped_coo_tensor.MergeAll();
+    }
+  }
+
+  absl::Span<const CooFormat> operator()(int local_sc_id, int bucket_id) const {
+    return grouped_coo_tensors[local_sc_id](bucket_id);
+  }
+
+  void Add(int local_sc_id, int bucket_id, const CooFormat& coo_tensor) {
+    grouped_coo_tensors[local_sc_id].Add(bucket_id, coo_tensor);
+  }
+
+  int GetNumMinibatches() const {
+    for (const auto& grouped_coo_tensor : grouped_coo_tensors) {
+      DCHECK_EQ(grouped_coo_tensor.GetNumMinibatches(),
+                grouped_coo_tensors[0].GetNumMinibatches());
+    }
+    return grouped_coo_tensors[0].GetNumMinibatches();
+  }
 };
 
 }  // namespace jax_sc_embedding

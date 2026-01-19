@@ -37,6 +37,8 @@
 #include "jax_tpu_embedding/sparsecore/lib/core/coo_format.h"
 #include "jax_tpu_embedding/sparsecore/lib/core/input_preprocessing_threads.h"
 #include "jax_tpu_embedding/sparsecore/lib/core/partitioned_coo_tensors.h"
+#include "xla/tsl/concurrency/async_value_ref.h"  // from @xla
+#include "xla/tsl/concurrency/chain.h"  // from @xla
 
 namespace jax_sc_embedding {
 
@@ -87,12 +89,14 @@ enum class RowCombiner {
 
 RowCombiner GetRowCombiner(absl::string_view combiner);
 
+using MinibatchingSplit = std::bitset<CooFormat::kMaxMinibatchingBuckets - 1>;
+
 struct IdPair {
   int32_t col_id;
   int32_t row_id;
 };
 
-struct ExtractedCooTensors {
+struct ExtractedCooTensorsPerSparseCore {
   std::vector<IdPair> ids;
   // For storing gains, we use different strategies to optimize for memory and
   // performance:
@@ -112,29 +116,29 @@ struct ExtractedCooTensors {
   // data per-row for 'mean' and 'sqrtn', rather than per-tensor. (We only
   // perform 1 push_back per row, rather than per tensor.)
   std::vector<float> gains;
-  // Number of samples these coo_tensors are extracted from.
-  int batch_size_for_device;
   std::vector<int> row_token_counts;
   std::vector<float> row_gains;
-  // Count coo tensors per SC for efficient allocation of vector for sorting and
-  // grouping them. Might be lower after deduplication.
-  std::vector<int> coo_tensors_per_sc;
   bool has_variable_weights_;
+  int batch_size_per_sc_;
+  RowCombiner combiner_;
 
-  ExtractedCooTensors() : ExtractedCooTensors(0, 0) {}
-  ExtractedCooTensors(int num_sc_per_device, int batch_size_for_device,
-                      bool has_variable_weights = true,
-                      RowCombiner combiner = RowCombiner::kSum)
-      : batch_size_for_device(batch_size_for_device),
-        coo_tensors_per_sc(num_sc_per_device, 0),
-        has_variable_weights_(has_variable_weights) {
+  ExtractedCooTensorsPerSparseCore()
+      : has_variable_weights_(false),
+        batch_size_per_sc_(0),
+        combiner_(RowCombiner::kSum) {}
+  ExtractedCooTensorsPerSparseCore(int batch_size_per_sc,
+                                   bool has_variable_weights,
+                                   RowCombiner combiner)
+      : has_variable_weights_(has_variable_weights),
+        batch_size_per_sc_(batch_size_per_sc),
+        combiner_(combiner) {
     if (!has_variable_weights_) {
       switch (combiner) {
         case RowCombiner::kMean:
-          row_token_counts.resize(batch_size_for_device);
+          row_token_counts.resize(batch_size_per_sc);
           break;
         case RowCombiner::kSqrtn:
-          row_gains.resize(batch_size_for_device);
+          row_gains.resize(batch_size_per_sc);
           break;
         case RowCombiner::kSum:
           break;
@@ -142,54 +146,23 @@ struct ExtractedCooTensors {
     }
   }
 
-  // Test only constructor.
-  ExtractedCooTensors(int num_sc_per_device, int batch_size_for_device,
-                      absl::Span<const CooFormat> coos)
-      : batch_size_for_device(batch_size_for_device),
-        coo_tensors_per_sc(num_sc_per_device, 0),
-        has_variable_weights_(false) {
-    ids.reserve(coos.size());
-
-    // Check if any of the gains are not 1.0.
-    for (const auto& coo : coos) {
-      if (coo.gain != 1.0f) {
-        has_variable_weights_ = true;
-        break;
-      }
-    }
-
-    // If we have variable weights, we need to store the gains.
-    if (has_variable_weights_) {
-      gains.reserve(coos.size());
-    }
-
-    // Add all the coos to the extracted coo tensors.
-    for (const auto& coo : coos) {
-      ids.push_back({.col_id = coo.col_id, .row_id = coo.row_id});
-      if (has_variable_weights_) {
-        gains.push_back(coo.gain);
-      }
-    }
-
-    // Populate the coo_tensors_per_sc vector.
-    DCHECK_GT(num_sc_per_device, 0);
-    DCHECK_EQ(batch_size_for_device % num_sc_per_device, 0);
-    const int batch_size_per_sc = batch_size_for_device / num_sc_per_device;
-    for (const auto& id_pair : ids) {
-      coo_tensors_per_sc[id_pair.row_id / batch_size_per_sc]++;
-    }
-  }
-
   bool has_variable_weights() const { return has_variable_weights_; }
 
-  void emplace_back(int row_id, int embedding_id, float gain, int col_shift,
+  void emplace_back(int row_id, int embedding_id, int col_shift,
                     int col_offset, int num_scs_mod) {
+    DCHECK(!has_variable_weights_);
     this->ids.push_back({.col_id = CooFormat::GetColId(embedding_id, col_shift,
                                                        col_offset, num_scs_mod),
                          .row_id = row_id});
-    if (has_variable_weights_) {
-      this->gains.push_back(gain);
-    }
+  }
+
+  void emplace_back_with_gain(int row_id, int embedding_id, float gain,
+                              int col_shift, int col_offset, int num_scs_mod) {
+    DCHECK(has_variable_weights_);
+    this->ids.push_back({.col_id = CooFormat::GetColId(embedding_id, col_shift,
+                                                       col_offset, num_scs_mod),
+                         .row_id = row_id});
+    this->gains.push_back(gain);
   }
 
   size_t size() const { return ids.size(); }
@@ -201,14 +174,21 @@ struct ExtractedCooTensors {
     }
   }
 
+  // Test only method to get the CooFormat at index i.
   CooFormat get(int i) const {
-    return CooFormat(ids[i].row_id, ids[i].col_id,
-                     has_variable_weights_ ? gains[i] : 1.0f);
+    float gain = 1.0f;
+    if (has_variable_weights_) {
+      gain = gains[i];
+    } else if (!row_token_counts.empty()) {
+      gain = 1.0f / row_token_counts[ids[i].row_id % batch_size_per_sc_];
+    } else if (!row_gains.empty()) {
+      gain = row_gains[ids[i].row_id % batch_size_per_sc_];
+    }
+    return CooFormat(ids[i].row_id, ids[i].col_id, gain);
   }
 
   template <bool kHasVariableWeights>
-  CooFormat GetCooFormatWithGain(uint64_t key, uint32_t col_id,
-                                 RowCombiner combiner) const {
+  CooFormat GetCooFormatWithGain(uint64_t key, uint32_t col_id) const {
     float gain = 1.0f;
     uint32_t row_id;
     if constexpr (kHasVariableWeights) {
@@ -217,15 +197,16 @@ struct ExtractedCooTensors {
       gain = gains[index];
     } else {
       row_id = CooFormat::GetDataFromKey(key);
-      switch (combiner) {
+      switch (combiner_) {
         case RowCombiner::kMean:
-          gain = 1.0f / static_cast<float>(row_token_counts[row_id]);
+          gain = 1.0f / static_cast<float>(
+                            row_token_counts[row_id % batch_size_per_sc_]);
           break;
         case RowCombiner::kSum:
           gain = 1.0f;
           break;
         case RowCombiner::kSqrtn:
-          gain = row_gains[row_id];
+          gain = row_gains[row_id % batch_size_per_sc_];
           break;
       }
     }
@@ -243,9 +224,117 @@ struct ExtractedCooTensors {
   }
 };
 
+struct ExtractedCooTensors {
+  std::vector<tsl::AsyncValueRef<ExtractedCooTensorsPerSparseCore>>
+      per_sc_tensors_av;
+  int batch_size_for_device;
+  RowCombiner combiner_;
+  bool has_variable_weights_;
+
+  ExtractedCooTensors()
+      : batch_size_for_device(0),
+        combiner_(RowCombiner::kSum),
+        has_variable_weights_(false) {}
+  ExtractedCooTensors(int num_sc_per_device, int batch_size_for_device_in,
+                      bool has_variable_weights = true,
+                      RowCombiner combiner = RowCombiner::kSum)
+      : batch_size_for_device(batch_size_for_device_in),
+        combiner_(combiner),
+        has_variable_weights_(has_variable_weights) {
+    per_sc_tensors_av.reserve(num_sc_per_device);
+    for (int i = 0; i < num_sc_per_device; ++i) {
+      per_sc_tensors_av.push_back(tsl::MakeUnconstructedAsyncValueRef<
+                                  ExtractedCooTensorsPerSparseCore>());
+    }
+  }
+
+  // Test only constructor.
+  ExtractedCooTensors(int num_sc_per_device, int batch_size_for_device,
+                      absl::Span<const CooFormat> coos)
+      : batch_size_for_device(batch_size_for_device),
+        combiner_(RowCombiner::kSum),
+        has_variable_weights_(false) {
+    // Check if any of the gains are not 1.0.
+    for (const auto& coo : coos) {
+      if (coo.gain != 1.0f) {
+        has_variable_weights_ = true;
+        break;
+      }
+    }
+
+    per_sc_tensors_av.reserve(num_sc_per_device);
+    int batch_size_per_sc =
+        num_sc_per_device > 0 ? batch_size_for_device / num_sc_per_device : 0;
+    for (int i = 0; i < num_sc_per_device; ++i) {
+      per_sc_tensors_av.push_back(tsl::MakeUnconstructedAsyncValueRef<
+                                  ExtractedCooTensorsPerSparseCore>());
+      per_sc_tensors_av.back().emplace(batch_size_per_sc, has_variable_weights_,
+                                       combiner_);
+    }
+
+    // If we have variable weights, we need to store the gains.
+    for (int i = 0; i < num_sc_per_device; ++i) {
+      per_sc_tensors_av[i].get().reserve(coos.size() / num_sc_per_device);
+    }
+
+    // Add all the coos to the extracted coo tensors.
+    for (const auto& coo : coos) {
+      int sc_id = coo.row_id / batch_size_per_sc;
+      per_sc_tensors_av[sc_id].get().ids.push_back(
+          {.col_id = coo.col_id, .row_id = coo.row_id});
+      if (has_variable_weights_) {
+        per_sc_tensors_av[sc_id].get().gains.push_back(coo.gain);
+      }
+    }
+  }
+
+  bool has_variable_weights() const { return has_variable_weights_; }
+
+  // For test only.
+  void BlockUntilReady() {
+    for (const auto& sc_tensor_av : per_sc_tensors_av) {
+      tsl::BlockUntilReady(sc_tensor_av);
+    }
+  }
+
+  // For test only.
+  size_t size() const {
+    size_t total_size = 0;
+    for (const auto& sc_tensor_av : per_sc_tensors_av) {
+      total_size += sc_tensor_av.get().size();
+    }
+    return total_size;
+  }
+
+  // For test only.
+  size_t GetScSize(int sc_id) const {
+    tsl::BlockUntilReady(per_sc_tensors_av[sc_id]);
+    return per_sc_tensors_av[sc_id].get().size();
+  }
+
+  // For test only.
+  std::vector<CooFormat> ToCooVector() const {
+    std::vector<CooFormat> coos;
+    for (const auto& sc_tensor_av : per_sc_tensors_av) {
+      tsl::BlockUntilReady(sc_tensor_av);
+      for (int i = 0; i < sc_tensor_av.get().size(); ++i) {
+        coos.push_back(sc_tensor_av.get().get(i));
+      }
+    }
+    return coos;
+  }
+};
+
+struct DeviceSortingTaskResult {
+  DevicePartitionedCooTensors grouped_coo_tensors;
+  int total_dropped_id_count = 0;
+  bool table_minibatching_required = false;
+  MinibatchingSplit table_minibatching_split = 0;
+};
+
 namespace internal {
 
-struct CsrArraysPerDevice {
+struct CsrArraysRefPerDevice {
   Eigen::Ref<RowVectorXi> row_pointers;
   Eigen::Ref<RowVectorXi> embedding_ids;
   Eigen::Ref<RowVectorXi> sample_ids;
@@ -277,9 +366,9 @@ struct CsrArraysPerHost {
         sample_ids(sample_ids.data(), sample_ids.rows(), sample_ids.cols()),
         gains(gains.data(), gains.rows(), gains.cols()) {}
 
-  internal::CsrArraysPerDevice GetCsrArraysPerDevice(int local_device_id)
+  internal::CsrArraysRefPerDevice GetCsrArraysRefForDevice(int local_device_id)
       ABSL_ATTRIBUTE_LIFETIME_BOUND {
-    return internal::CsrArraysPerDevice{
+    return internal::CsrArraysRefPerDevice{
         .row_pointers = row_pointers.row(local_device_id),
         .embedding_ids = embedding_ids.row(local_device_id),
         .sample_ids = sample_ids.row(local_device_id),
@@ -341,19 +430,6 @@ struct StatsPerHost {
   }
 };
 
-using MinibatchingSplit = std::bitset<CooFormat::kMaxMinibatchingBuckets - 1>;
-
-enum class FeatureStackingStrategy {
-  // Stack all features into one large tensor, then split it across SparseCores.
-  // Simpler data layout but can cause load imbalance if features have different
-  // computational costs.
-  kStackThenSplit = 0,
-  // Split each feature individually, then stack the corresponding shards on
-  // each SparseCore. Generally provides better load balancing, as each
-  // SparseCore processes an equal portion of every feature.
-  kSplitThenStack = 1
-};
-
 enum class ShardingStrategy : int { kMod = 1 };
 
 inline void PreprocessingThreadPoolSchedule(std::function<void()> callback) {
@@ -371,9 +447,6 @@ struct PreprocessSparseDenseMatmulInputOptions {
   const ShardingStrategy sharding_strategy = ShardingStrategy::kMod;
   // Whether to allow dropping embedding IDs if the buffer size is exceeded.
   const bool allow_id_dropping = true;
-  // The strategy used for stacking features from different tables.
-  FeatureStackingStrategy feature_stacking_strategy =
-      FeatureStackingStrategy::kSplitThenStack;
   // Whether mini-batching is enabled.
   const bool enable_minibatching = false;
 
@@ -397,13 +470,6 @@ struct PreprocessSparseDenseMatmulInputOptions {
   absl::FunctionRef<void(std::function<void()>)> async_task_scheduler =
       PreprocessingThreadPoolSchedule;
 
-  // Number of SparseCores to group into a single sorting task.
-  // This controls the parallelism of the sorting phase. Defaults to
-  // num_sc_per_device.
-  // TODO(b/469153631): Figure out heuristic to avoid over-parallelization
-  // of small tables (which incur significant overhead).
-  int num_sc_per_sorting_task = num_sc_per_device;
-
   // Returns the total number of SparseCores across all devices and hosts.
   uint32_t GetNumScs() const { return num_sc_per_device * global_device_count; }
 };
@@ -411,9 +477,14 @@ struct PreprocessSparseDenseMatmulInputOptions {
 static_assert(
     std::is_trivially_copyable<PreprocessSparseDenseMatmulInputOptions>());
 
-struct StackedTableMetadata {
-  StackedTableMetadata() = delete;
-  StackedTableMetadata(
+// This represents the metadata for a single feature corresponding to tables in
+// a stack of tables. If multiple features are stacked for a given table, they
+// will have different row offsets, but same col_offset. Both the offsets are
+// global and use global_batch_size. Additionally, the vocabulary sharding may
+// be rotated among the distributed chips by using col_shift.
+struct FeatureMetadataInStack {
+  FeatureMetadataInStack() = delete;
+  FeatureMetadataInStack(
       absl::string_view name, int feature_index, int max_ids_per_partition,
       int max_unique_ids_per_partition, int row_offset, int col_offset,
       int col_shift, int batch_size,
@@ -435,8 +506,8 @@ struct StackedTableMetadata {
 
   std::string name;
 
-  // The batch is given as a list of features (numpy arrays). `feature_index`
-  // represents the index of the feature in the list.
+  // The input batch consists of a list of features. `feature_index` is the
+  // index of the feature in the list.
   int feature_index;
 
   int max_ids_per_partition;
@@ -457,26 +528,38 @@ struct StackedTableMetadata {
   // shard.
   int max_col_id;
 
-  bool operator==(const StackedTableMetadata& other) const = default;
+  bool operator==(const FeatureMetadataInStack& other) const = default;
 };
 
 int ComputeCooBufferSizePerDevice(
     int num_scs, int num_scs_per_device,
-    absl::Span<const StackedTableMetadata> stacked_table_metadata,
+    absl::Span<const FeatureMetadataInStack> stacked_table_metadata,
     int batch_number = 0, bool use_minibatching = false);
 
 int MaxIdsPerPartitionForStackedTables(
-    absl::Span<const StackedTableMetadata> stacked_table_metadata);
+    absl::Span<const FeatureMetadataInStack> stacked_table_metadata);
 
 std::optional<int> SuggestedCooBufferSizeForStackedTables(
-    absl::Span<const StackedTableMetadata> stacked_table_metadata);
+    absl::Span<const FeatureMetadataInStack> stacked_table_metadata);
 
+// Blocking version for testing only.
 void FillLocalDeviceBuffer(
-    const PartitionedCooTensors& grouped_coo_tensors,
+    const DevicePartitionedCooTensors& grouped_coo_tensors,
     int row_pointers_size_per_bucket, int coo_buffer_size_per_sc,
-    int batch_size_per_sc,
+    int batch_size_per_sc, const BlockRow<int>& required_sc_buffer_sizes,
     const PreprocessSparseDenseMatmulInputOptions& options,
-    internal::CsrArraysPerDevice& csr, int& dropped_id_count_static_bound);
+    absl::string_view stacked_table_name,
+    internal::CsrArraysRefPerDevice& csr_arrays,
+    int& dropped_id_count_static_bound);
+
+// Returns the number of dropped IDs.
+tsl::AsyncValueRef<int> FillLocalDeviceBufferAsync(
+    const DevicePartitionedCooTensors& grouped_coo_tensors,
+    int row_pointers_size_per_bucket, int coo_buffer_size_per_sc,
+    int batch_size_per_sc, const BlockRow<int>& required_sc_buffer_sizes,
+    const PreprocessSparseDenseMatmulInputOptions& options,
+    absl::string_view stacked_table_name,
+    internal::CsrArraysRefPerDevice csr_arrays);
 
 }  // namespace jax_sc_embedding
 

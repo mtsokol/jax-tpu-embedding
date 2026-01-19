@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include "absl/algorithm/container.h"  // from @com_google_absl
+#include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/log/check.h"  // from @com_google_absl
@@ -42,11 +42,13 @@
 #include "jax_tpu_embedding/sparsecore/lib/core/input_preprocessing_util.h"
 #include "jax_tpu_embedding/sparsecore/lib/core/partitioned_coo_tensors.h"
 #include "jax_tpu_embedding/sparsecore/lib/core/sort_and_group_coo_tensors_impl.h"
+#include "xla/tsl/concurrency/async_value.h"  // from @xla
 #include "xla/tsl/concurrency/async_value_ref.h"  // from @xla
 #include "tsl/platform/env.h"  // from @tsl
 #include "tsl/platform/statusor.h"  // from @tsl
 #include "xla/util.h"  // from @xla
 #include "tsl/profiler/lib/traceme.h"
+#include "tsl/profiler/lib/traceme_encode.h"
 
 namespace jax_sc_embedding {
 
@@ -63,7 +65,7 @@ struct FeatureSliceInfo {
 
 struct FeatureSlice {
   FeatureSliceInfo info;
-  const StackedTableMetadata* metadata;
+  const FeatureMetadataInStack* metadata;
 };
 
 void AllocateOutputCsrBuffersIfNeeded(
@@ -78,11 +80,11 @@ void AllocateOutputCsrBuffersIfNeeded(
 
 // Extract the COO tensors for a single feature slice.
 void ExtractCooTensorsForSingleFeatureSlice(
-    const StackedTableMetadata& metadata,
+    const FeatureMetadataInStack& metadata,
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
     const FeatureSliceInfo& slice_info,
     const PreprocessSparseDenseMatmulInputOptions& options,
-    ExtractedCooTensors& extracted_coo_tensors) {
+    ExtractedCooTensorsPerSparseCore& extracted_coo_tensors) {
   const int feature_index = metadata.feature_index;
   const std::unique_ptr<AbstractInputBatch>& curr_batch =
       input_batches[feature_index];
@@ -135,7 +137,7 @@ void CheckDeviceBatchSize(int batch_size_for_device, int num_sc_per_device,
 // has explicitly variable weights.
 bool StackHasVariableWeights(
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
-    absl::Span<const StackedTableMetadata> stacked_table_metadata) {
+    absl::Span<const FeatureMetadataInStack> stacked_table_metadata) {
   for (const auto& metadata : stacked_table_metadata) {
     if (input_batches[metadata.feature_index]->HasVariableWeights()) {
       return true;
@@ -149,7 +151,7 @@ bool StackHasVariableWeights(
 // CSR arrays, and statistics.
 struct TableState {
   absl::string_view stacked_table_name;
-  absl::Span<const StackedTableMetadata> stacked_table_metadata;
+  absl::Span<const FeatureMetadataInStack> stacked_table_metadata;
   bool has_variable_weights;
   int coo_buffer_size_per_device;
   CsrArraysPerHost csr_arrays_per_host;
@@ -158,11 +160,11 @@ struct TableState {
   bool table_minibatching_required = false;
   MinibatchingSplit table_minibatching_split = 0;
   std::vector<ExtractedCooTensors> extracted_coo_tensors_per_device;
-  std::vector<PartitionedCooTensors> partitioned_coo_tensors_per_device;
-  std::vector<int> dropped_id_count_per_device;
+  std::vector<tsl::AsyncValueRef<DeviceSortingTaskResult>>
+      device_sorting_results;
 
   TableState(absl::string_view name,
-             absl::Span<const StackedTableMetadata> metadata,
+             absl::Span<const FeatureMetadataInStack> metadata,
              bool has_variable_weights,
              const PreprocessSparseDenseMatmulInputOptions& options,
              int num_scs, int coo_buffer_size_per_device,
@@ -178,25 +180,26 @@ struct TableState {
                        options.num_sc_per_device),
         batch_size_for_device(0) {
     extracted_coo_tensors_per_device.resize(options.local_device_count);
-    partitioned_coo_tensors_per_device.resize(options.local_device_count);
-    dropped_id_count_per_device.resize(options.local_device_count, 0);
+    device_sorting_results.resize(options.local_device_count);
   }
 };
 
 template <typename SplitType>
-tsl::AsyncValueRef<std::pair<PartitionedCooTensors, int>>
+tsl::AsyncValueRef<DeviceSortingTaskResult>
 SortAndGroupCooTensorsForTableStateAsync(
     TableState& state, int local_device,
     const PreprocessSparseDenseMatmulInputOptions& options,
-    internal::StatsPerDevice stats, SplitType& split) {
+    internal::StatsPerDevice stats) {
   if (state.has_variable_weights) {
-    return SortAndGroupCooTensorsPerLocalDeviceAsync<true>(
+    return SortAndGroupCooTensorsPerLocalDeviceAsync<true, SplitType>(
         state.extracted_coo_tensors_per_device[local_device],
-        state.stacked_table_metadata[0], options, stats, split);
+        state.stacked_table_name, state.stacked_table_metadata[0], options,
+        stats);
   } else {
-    return SortAndGroupCooTensorsPerLocalDeviceAsync<false>(
+    return SortAndGroupCooTensorsPerLocalDeviceAsync<false, SplitType>(
         state.extracted_coo_tensors_per_device[local_device],
-        state.stacked_table_metadata[0], options, stats, split);
+        state.stacked_table_name, state.stacked_table_metadata[0], options,
+        stats);
   }
 }
 
@@ -207,48 +210,43 @@ SortAndGroupCooTensorsForTableStateAsync(
 void ExtractSortAndGroupCooTensorsForTable(
     TableState& state,
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
-    const PreprocessSparseDenseMatmulInputOptions& options,
-    absl::BlockingCounter& counter) {
+    const PreprocessSparseDenseMatmulInputOptions& options) {
   tsl::profiler::TraceMe traceme([&] {
     return tsl::profiler::TraceMeEncode(
-        absl::StrCat("InputPreprocessingTable-ExtractSortGroup-",
-                     state.stacked_table_name),
+        absl::StrCat("ScheduleExtractSortGroup/", state.stacked_table_name),
         {{"batch_number", options.batch_number}});
   });
   for (int local_device = 0; local_device < options.local_device_count;
        ++local_device) {
-    options.async_task_scheduler(
-        [&, local_device, &state = state, input_batches] {
-          state.extracted_coo_tensors_per_device[local_device] =
-              internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
-                  state.stacked_table_metadata, input_batches, local_device,
-                  options, state.has_variable_weights);
+    // This extracts Coo tensors per SC in parallel by launching one async
+    // task per SC via async_task_scheduler within
+    // ExtractCooTensorsForAllFeaturesPerLocalDevice.
+    state.extracted_coo_tensors_per_device[local_device] =
+        internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
+            state.stacked_table_metadata, input_batches, local_device, options,
+            state.has_variable_weights);
 
-          internal::StatsPerDevice stats_per_device =
-              state.stats_per_host.GetStatsPerDevice(local_device);
-          auto result_av = SortAndGroupCooTensorsForTableStateAsync(
-              state, local_device, options, stats_per_device,
-              state.table_minibatching_required);
+    internal::StatsPerDevice stats_per_device =
+        state.stats_per_host.GetStatsPerDevice(local_device);
 
-          result_av.AndThen([result_av, &state, local_device, &counter] {
-            auto& result = result_av.get();
-            state.partitioned_coo_tensors_per_device[local_device] =
-                std::move(result.first);
-            state.dropped_id_count_per_device[local_device] = result.second;
-            counter.DecrementCount();
-          });
-        });
+    // This sorts and groups Coo tensors per SC in parallel. Each sorting
+    // task waits for the corresponding SC extraction to finish before
+    // starting (dependency is handled in
+    // SortAndGroupCooTensorsPerLocalDeviceImpl via RunWhenReady).
+    state.device_sorting_results[local_device] =
+        SortAndGroupCooTensorsForTableStateAsync<bool>(
+            state, local_device, options, stats_per_device);
   }
 }
 
 void PostProcessTableState(TableState& state) {
-  state.stats_per_host.dropped_id_count =
-      absl::c_accumulate(state.dropped_id_count_per_device, 0LL);
-
-  state.batch_size_for_device =
-      state.extracted_coo_tensors_per_device[0].batch_size_for_device;
-  for (const auto& extracted_coo : state.extracted_coo_tensors_per_device) {
-    DCHECK_EQ(state.batch_size_for_device, extracted_coo.batch_size_for_device);
+  state.stats_per_host.dropped_id_count = 0;
+  for (const auto& result_av : state.device_sorting_results) {
+    state.stats_per_host.dropped_id_count +=
+        result_av.get().total_dropped_id_count;
+    state.table_minibatching_required |=
+        result_av.get().table_minibatching_required;
+    state.table_minibatching_split |= result_av.get().table_minibatching_split;
   }
 }
 
@@ -258,18 +256,21 @@ void PostProcessTableState(TableState& state) {
 // `state`: The TableState holding the COO tensors and statistics.
 // `options`: Preprocessing options.
 void CreateMinibatchingBucketsForTable(
-    TableState& state, const PreprocessSparseDenseMatmulInputOptions& options,
-    absl::BlockingCounter& counter) {
+    TableState& state, const PreprocessSparseDenseMatmulInputOptions& options) {
   tsl::profiler::TraceMe traceme([&] {
     return tsl::profiler::TraceMeEncode(
-        absl::StrCat("InputPreprocessingTable-CreateMinibatchingBuckets-",
+        absl::StrCat("ScheduleCreateMinibatchingBuckets/",
                      state.stacked_table_name),
         {{"batch_number", options.batch_number}});
   });
   state.stats_per_host.dropped_id_count = 0;
+  state.device_sorting_results.assign(
+      options.local_device_count,
+      tsl::AsyncValueRef<DeviceSortingTaskResult>());
+  absl::BlockingCounter counter(options.local_device_count);
   for (int local_device = 0; local_device < options.local_device_count;
        ++local_device) {
-    options.async_task_scheduler([&, local_device, &state = state] {
+    options.async_task_scheduler([&, local_device] {
       // Note: We create a dummy stats object here because we don't want to
       // overwrite the stats from the first pass, which are authoritative.
       // The only stat we care about from this second pass is the number of
@@ -279,20 +280,24 @@ void CreateMinibatchingBucketsForTable(
           options.num_sc_per_device);
       internal::StatsPerDevice dummy_stats =
           dummy_stats_host->GetStatsPerDevice(0);
-      auto result_av = SortAndGroupCooTensorsForTableStateAsync(
-          state, local_device, options, dummy_stats,
-          state.table_minibatching_split);
-
-      result_av.AndThen(
-          [result_av, &state, local_device, &counter, dummy_stats_host] {
-            auto& result = result_av.get();
-            state.partitioned_coo_tensors_per_device[local_device] =
-                std::move(result.first);
-            state.dropped_id_count_per_device[local_device] = result.second;
+      auto result_av =
+          SortAndGroupCooTensorsForTableStateAsync<MinibatchingSplit>(
+              state, local_device, options, dummy_stats);
+      state.device_sorting_results[local_device] = result_av;
+      // `dummy_stats_host` must be kept alive until `result_av` is
+      // ready, because `dummy_stats` (which is used in the async task
+      // that produces `result_av`) holds references to data owned by
+      // `dummy_stats_host`. Moving `dummy_stats_host` into this
+      // `AndThen` callback ensures its lifetime is extended until the
+      // async operation completes.
+      result_av.GetAsyncValue()->AndThen(
+          [dummy_stats_host = std::move(dummy_stats_host), &counter] {
             counter.DecrementCount();
           });
     });
   }
+  // Wait for all local devices to finish.
+  counter.Wait();
 }
 
 }  // namespace
@@ -309,7 +314,7 @@ inline bool Deserialize(bool value) { return value; }
 
 // Extract the COO tensors for all features.
 ExtractedCooTensors ExtractCooTensorsForAllFeaturesPerLocalDevice(
-    const absl::Span<const StackedTableMetadata> stacked_table_metadata,
+    const absl::Span<const FeatureMetadataInStack> stacked_table_metadata,
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
     const int local_device_id,
     const PreprocessSparseDenseMatmulInputOptions& options,
@@ -323,19 +328,8 @@ ExtractedCooTensors ExtractCooTensorsForAllFeaturesPerLocalDevice(
   }
 
   // Determine the number of slices per feature based on stacking strategy.
-  int feature_slices_per_device;
-  switch (options.feature_stacking_strategy) {
-    case FeatureStackingStrategy::kStackThenSplit:
-      feature_slices_per_device = 1;
-      break;
-    case FeatureStackingStrategy::kSplitThenStack:
-      feature_slices_per_device = options.num_sc_per_device;
-      break;
-    default:
-      LOG(FATAL) << "Unsupported feature stacking strategy: "
-                 << static_cast<int>(options.feature_stacking_strategy);
-      break;
-  }
+  // With split-then-stack, each feature is split into num_sc_per_device slices.
+  const int feature_slices_per_device = options.num_sc_per_device;
 
   CheckDeviceBatchSize(batch_size_for_device, options.num_sc_per_device,
                        stacked_table_metadata[0].name);
@@ -356,8 +350,8 @@ ExtractedCooTensors ExtractCooTensorsForAllFeaturesPerLocalDevice(
   std::vector<FeatureSlice> feature_slices(feature_slices_per_device *
                                            stacked_table_metadata.size());
 
-  int64_t total_ids_for_device = 0;
   bool exact_size_known = true;
+  std::vector<int64_t> ids_per_sc(options.num_sc_per_device, 0);
 
   for (int feature_idx = 0; feature_idx < stacked_table_metadata.size();
        ++feature_idx) {
@@ -392,11 +386,11 @@ ExtractedCooTensors ExtractCooTensorsForAllFeaturesPerLocalDevice(
       if (exact_size_known) {
         std::optional<int64_t> ids_in_slice =
             curr_batch->GetIdsCountInSlice(start_index, end_index);
-        if (!ids_in_slice.has_value()) {
+        if (ids_in_slice.has_value()) {
+          ids_per_sc[feature_slice_id] += ids_in_slice.value();
+        } else {
           exact_size_known = false;
-          continue;
         }
-        total_ids_for_device += ids_in_slice.value();
       }
     }
   }
@@ -404,22 +398,43 @@ ExtractedCooTensors ExtractCooTensorsForAllFeaturesPerLocalDevice(
   // If exact size is not known, fall back to using the total id_count per
   // feature.
   if (!exact_size_known) {
-    total_ids_for_device = 0;
+    int64_t total_ids_for_device = 0;
     for (const auto& feature_metadata : stacked_table_metadata) {
       total_ids_for_device +=
           input_batches[feature_metadata.feature_index]->id_count() /
           options.local_device_count;
     }
+    int64_t ids_per_sc_est = total_ids_for_device / options.num_sc_per_device;
+    for (int i = 0; i < options.num_sc_per_device; ++i) {
+      ids_per_sc[i] = ids_per_sc_est;
+    }
   }
 
-  // Reserve memory for COO tensors.
-  extracted_coo_tensors.reserve(total_ids_for_device);
-
-  // Extract COO tensors for each slice.
-  for (const auto& slice : feature_slices) {
-    ExtractCooTensorsForSingleFeatureSlice(*slice.metadata, input_batches,
-                                           slice.info, options,
-                                           extracted_coo_tensors);
+  // Extract COO tensors for each slice asynchronously per SC.
+  for (int sc_id = 0; sc_id < options.num_sc_per_device; ++sc_id) {
+    auto av = extracted_coo_tensors.per_sc_tensors_av[sc_id];
+    options.async_task_scheduler([=] {
+      tsl::profiler::TraceMe traceme([&] {
+        return tsl::profiler::TraceMeEncode(
+            absl::StrCat("ExtractCooTensors/", stacked_table_metadata[0].name,
+                         "/SC", sc_id),
+            {{"batch_number", options.batch_number}});
+      });
+      ExtractedCooTensorsPerSparseCore coo_tensors_per_sc(
+          batch_size_per_slice, has_variable_weights,
+          stacked_table_metadata[0].row_combiner);
+      coo_tensors_per_sc.reserve(ids_per_sc[sc_id]);
+      for (int feature_idx = 0; feature_idx < stacked_table_metadata.size();
+           ++feature_idx) {
+        const auto& slice =
+            feature_slices[sc_id * stacked_table_metadata.size() + feature_idx];
+        ExtractCooTensorsForSingleFeatureSlice(*slice.metadata, input_batches,
+                                               slice.info, options,
+                                               coo_tensors_per_sc);
+      }
+      av.emplace(
+          std::move(coo_tensors_per_sc));
+    });
   }
   return extracted_coo_tensors;
 }
@@ -498,7 +513,11 @@ absl::StatusOr<bool> SyncMinibatchingRequired(
   }
   bool local_minibatching_required = false;
   for (const auto& state : table_states) {
-    local_minibatching_required |= state.table_minibatching_required;
+    for (const auto& sorting_result_av : state.device_sorting_results) {
+      tsl::BlockUntilReady(sorting_result_av);
+      local_minibatching_required |=
+          sorting_result_av.get().table_minibatching_required;
+    }
   }
   if (options.all_reduce_interface != nullptr) {
     TF_ASSIGN_OR_RETURN(auto reduced_value,
@@ -524,7 +543,10 @@ absl::StatusOr<MinibatchingSplit> SyncMinibatchingSplit(
   });
   MinibatchingSplit local_minibatching_split = 0;
   for (const auto& state : table_states) {
-    local_minibatching_split |= state.table_minibatching_split;
+    for (const auto& sorting_result_av : state.device_sorting_results) {
+      local_minibatching_split |=
+          sorting_result_av.get().table_minibatching_split;
+    }
   }
   if (options.all_reduce_interface != nullptr) {
     TF_ASSIGN_OR_RETURN(auto reduced_value,
@@ -540,19 +562,20 @@ absl::StatusOr<MinibatchingSplit> SyncMinibatchingSplit(
 // Populates the output structure `out` with the processed data from the
 // `TableState`. This includes moving the CSR arrays and statistics for the
 // current stacked table. The `output_mutex` is used to protect access to `out`.
-void PopulateOutput(TableState& state, PreprocessSparseDenseMatmulOutput& out,
-                    absl::Mutex& output_mutex) {
+void PopulateOutputStats(TableState& state,
+                         SparseDenseMatmulInputStats& stats,
+                         absl::Mutex& output_mutex) {
   state.stats_per_host.Flatten();
 
   absl::MutexLock lock(output_mutex);
 
-  out.stats.max_ids_per_partition[state.stacked_table_name] =
+  stats.max_ids_per_partition[state.stacked_table_name] =
       std::move(state.stats_per_host.max_ids_per_partition);
-  out.stats.max_unique_ids_per_partition[state.stacked_table_name] =
+  stats.max_unique_ids_per_partition[state.stacked_table_name] =
       std::move(state.stats_per_host.max_unique_ids_per_partition);
-  out.stats.required_buffer_sizes[state.stacked_table_name] =
+  stats.required_buffer_sizes[state.stacked_table_name] =
       std::move(state.stats_per_host.required_buffer_size);
-  out.stats.dropped_id_count[state.stacked_table_name] =
+  stats.dropped_id_count[state.stacked_table_name] =
       state.stats_per_host.dropped_id_count;
 }
 
@@ -573,18 +596,29 @@ void FillDeviceBuffersForTable(
     absl::BlockingCounter& counter) {
   tsl::profiler::TraceMe traceme([&] {
     return tsl::profiler::TraceMeEncode(
-        absl::StrCat("InputPreprocessingTable-FillBuffer-",
-                     state.stacked_table_name),
+        absl::StrCat("ScheduleFillBuffer/", state.stacked_table_name),
         {{"batch_number", options.batch_number}});
   });
   for (int local_device = 0; local_device < options.local_device_count;
        ++local_device) {
-    options.async_task_scheduler([&, local_device, &state = state,
-                                  row_pointers_size_per_bucket,
-                                  global_minibatching_required,
-                                  global_minibatching_split] {
-      PartitionedCooTensors& grouped_coo_tensors =
-          state.partitioned_coo_tensors_per_device[local_device];
+    tsl::AsyncValueRef<DeviceSortingTaskResult>& sorting_result_av =
+        state.device_sorting_results[local_device];
+    // This continuation is scheduled when sorting for `local_device` completes.
+    sorting_result_av.AndThen([&, local_device, sorting_result_av,
+                               &state = state, row_pointers_size_per_bucket,
+                               global_minibatching_required,
+                               global_minibatching_split] {
+      state.batch_size_for_device =
+          state.extracted_coo_tensors_per_device[0].batch_size_for_device;
+      for (const auto& extracted_coo : state.extracted_coo_tensors_per_device) {
+        DCHECK_EQ(state.batch_size_for_device,
+                  extracted_coo.batch_size_for_device);
+      }
+
+      DevicePartitionedCooTensors& grouped_coo_tensors =
+          sorting_result_av.get().grouped_coo_tensors;
+      // If minibatching is required by any host, merge buckets
+      // according to the globally synchronized split.
       if (options.enable_minibatching && global_minibatching_required) {
         grouped_coo_tensors.Merge(global_minibatching_split);
       }
@@ -593,14 +627,24 @@ void FillDeviceBuffersForTable(
           state.batch_size_for_device, options.num_sc_per_device);
       const int coo_buffer_size_per_sc =
           state.coo_buffer_size_per_device / options.num_sc_per_device;
-      internal::CsrArraysPerDevice csr_arrays_per_device =
-          state.csr_arrays_per_host.GetCsrArraysPerDevice(local_device);
-      int table_dropped_ids = 0;
-      FillLocalDeviceBuffer(grouped_coo_tensors, row_pointers_size_per_bucket,
-                            coo_buffer_size_per_sc, batch_size_per_sc, options,
-                            csr_arrays_per_device, table_dropped_ids);
-      state.dropped_id_count_per_device[local_device] = table_dropped_ids;
-      counter.DecrementCount();
+      internal::CsrArraysRefPerDevice csr_arrays_per_device =
+          state.csr_arrays_per_host.GetCsrArraysRefForDevice(local_device);
+
+      const BlockRow<int>& required_sc_buffer_sizes =
+          state.stats_per_host.GetStatsPerDevice(local_device)
+              .required_buffer_size;
+
+      tsl::AsyncValueRef<int> dropped_id_count_av = FillLocalDeviceBufferAsync(
+          grouped_coo_tensors, row_pointers_size_per_bucket,
+          coo_buffer_size_per_sc, batch_size_per_sc, required_sc_buffer_sizes,
+          options, state.stacked_table_name, csr_arrays_per_device);
+
+      dropped_id_count_av.AndThen(
+          [sorting_result_av, &counter, dropped_id_count_av]() {
+            sorting_result_av.get().total_dropped_id_count +=
+                dropped_id_count_av.get();
+            counter.DecrementCount();
+          });
     });
   }
 }
@@ -611,7 +655,7 @@ GetOutputCsrBuffers(const std::string& stacked_table_name,
                     const PreprocessSparseDenseMatmulInputOptions& options,
                     int row_pointers_size_per_device,
                     int coo_buffer_size_per_device,
-                    OutputCsrArrays* output_csr_arrays,
+                    OutputCsrArrays* absl_nullable output_csr_arrays,
                     PreprocessSparseDenseMatmulOutput& out) {
   if (output_csr_arrays != nullptr) {
     DCHECK(output_csr_arrays->lhs_row_pointers.contains(stacked_table_name))
@@ -662,7 +706,7 @@ void FillDeviceBuffersAllTables(
     MinibatchingSplit global_minibatching_split) {
   tsl::profiler::TraceMe traceme([&] {
     return tsl::profiler::TraceMeEncode(
-        "FillDeviceBuffers", {{"batch_number", options.batch_number}});
+        "ScheduleFillDeviceBuffers", {{"batch_number", options.batch_number}});
   });
   absl::BlockingCounter counter(table_states.size() *
                                 options.local_device_count);
@@ -671,6 +715,11 @@ void FillDeviceBuffersAllTables(
                               global_minibatching_required,
                               global_minibatching_split, counter);
   }
+  traceme.Stop();
+  tsl::profiler::TraceMe traceme_wait([&] {
+    return tsl::profiler::TraceMeEncode(
+        "WaitForFillDeviceBuffers", {{"batch_number", options.batch_number}});
+  });
   counter.Wait();
 }
 
@@ -689,14 +738,13 @@ void SparseDenseMatmulInputStats::merge(
 absl::StatusOr<PreprocessSparseDenseMatmulOutput>
 PreprocessSparseDenseMatmulInput(
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
-    const absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>&
+    const absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>&
         stacked_tables,
     const PreprocessSparseDenseMatmulInputOptions& options,
-    OutputCsrArrays* output_csr_arrays) {
+    OutputCsrArrays* absl_nullable output_csr_arrays) {
   tsl::profiler::TraceMe traceme([&] {
     return tsl::profiler::TraceMeEncode(
-        absl::StrCat("input_preprocessing_cc-", options.local_device_count, "/",
-                     options.global_device_count),
+        absl::StrCat("jax_sc_embedding::PreprocessSparseDenseMatmulInput"),
         {{"batch_number", options.batch_number}});
   });
   if (options.sharding_strategy != ShardingStrategy::kMod) {
@@ -740,20 +788,15 @@ PreprocessSparseDenseMatmulInput(
   {
     tsl::profiler::TraceMe traceme([&] {
       return tsl::profiler::TraceMeEncode(
-          "ExtractSortAndGroupCooTensors",
+          "ScheduleExtractSortGroup",
           {{"batch_number", options.batch_number}});
     });
-    absl::BlockingCounter counter(table_states.size() *
-                                  options.local_device_count);
+    std::vector<tsl::AsyncValueRef<DeviceSortingTaskResult>> sorting_avs;
     for (auto& state : table_states) {
-      ExtractSortAndGroupCooTensorsForTable(state, input_batches, options,
-                                            counter);
-    }
-    counter.Wait();
-
-    // Post-process results after all threads are done.
-    for (auto& state : table_states) {
-      PostProcessTableState(state);
+      ExtractSortAndGroupCooTensorsForTable(state, input_batches, options);
+      for (const auto& av : state.device_sorting_results) {
+        sorting_avs.push_back(av);
+      }
     }
   }
 
@@ -769,26 +812,27 @@ PreprocessSparseDenseMatmulInput(
         }));
   }
 
-  // Redundant with global_minibatching_required_avr, but allows us to avoid
-  // the async dependency.
-  bool local_minibatching_required = false;
-  for (const auto& state : table_states) {
-    local_minibatching_required |= state.table_minibatching_required;
-  }
-
-  // If minibatching is not enabled, or not required locally we can fill
+  // If minibatching is not enabled, or if it is enabled, we fill
   // device buffers assuming minibatching is not required globally.
   // If it turns out that minibatching is required globally, we will
   // re-fill the buffers later.
-  if (!options.enable_minibatching || !local_minibatching_required) {
-    FillDeviceBuffersAllTables(absl::MakeSpan(table_states), options,
-                               row_pointers_size_per_bucket,
-                               /* global_minibatching_required= */ false,
-                               /* global_minibatching_split= */ 0);
+  FillDeviceBuffersAllTables(absl::MakeSpan(table_states), options,
+                             row_pointers_size_per_bucket,
+                             /* global_minibatching_required= */ false,
+                             /* global_minibatching_split= */ 0);
+
+  for (auto& state : table_states) {
+    tsl::RunWhenReady(absl::MakeConstSpan(state.device_sorting_results),
+                      [&state]() { PostProcessTableState(state); });
   }
 
   bool global_minibatching_required = false;
   if (options.enable_minibatching) {
+    tsl::profiler::TraceMe traceme([&] {
+      return tsl::profiler::TraceMeEncode(
+          "WaitForGlobalMinibatchingSync",
+          {{"batch_number", options.batch_number}});
+    });
     tsl::BlockUntilReady(global_minibatching_required_avr);
     TF_ASSIGN_OR_RETURN(global_minibatching_required,
                         *global_minibatching_required_avr);
@@ -801,17 +845,19 @@ PreprocessSparseDenseMatmulInput(
     {
       tsl::profiler::TraceMe traceme([&] {
         return tsl::profiler::TraceMeEncode(
-            "CreateMinibatchingBuckets",
+            "ScheduleCreateMinibatchingBuckets",
             {{"batch_number", options.batch_number}});
       });
-      absl::BlockingCounter counter(table_states.size() *
-                                    options.local_device_count);
+      std::vector<tsl::AsyncValueRef<DeviceSortingTaskResult>> sorting_avs;
       for (auto& state : table_states) {
-        CreateMinibatchingBucketsForTable(state, options, counter);
+        CreateMinibatchingBucketsForTable(state, options);
+        for (const auto& av : state.device_sorting_results) {
+          sorting_avs.push_back(av);
+        }
       }
-      counter.Wait();
       for (auto& state : table_states) {
-        PostProcessTableState(state);
+        tsl::RunWhenReady(absl::MakeConstSpan(state.device_sorting_results),
+                          [&state]() { PostProcessTableState(state); });
       }
     }
 
@@ -823,8 +869,11 @@ PreprocessSparseDenseMatmulInput(
   }
 
   for (auto& state : table_states) {
-    state.stats_per_host.dropped_id_count +=
-        absl::c_accumulate(state.dropped_id_count_per_device, 0LL);
+    state.stats_per_host.dropped_id_count = 0;
+    for (const auto& result_av : state.device_sorting_results) {
+      state.stats_per_host.dropped_id_count +=
+          result_av.get().total_dropped_id_count;
+    }
     // NOMUTANTS -- Informational.
     CheckBufferUsage(
         /* max_required_buffer_size_per_device= */
@@ -833,7 +882,7 @@ PreprocessSparseDenseMatmulInput(
         state.coo_buffer_size_per_device, state.stacked_table_name,
         options.batch_number);
 
-    PopulateOutput(state, out, output_mutex);
+    PopulateOutputStats(state, out.stats, output_mutex);
   }
 
   out.num_minibatches = global_minibatching_split.count() + 1;

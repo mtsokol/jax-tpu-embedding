@@ -20,6 +20,7 @@
 
 #include "absl/base/call_once.h"  // from @com_google_absl
 #include "absl/log/check.h"  // from @com_google_absl
+#include "absl/strings/str_cat.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
 #include "jax_tpu_embedding/sparsecore/lib/core/input_preprocessing_util.h"
 #include "jax_tpu_embedding/sparsecore/lib/core/process_coo_tensors_impl.h"
@@ -80,13 +81,15 @@ void PySparseCooInputBatch::ConstructRowPointersIfRequired() const {
 }
 
 void PySparseCooInputBatch::ExtractCooTensors(
-    const ExtractCooTensorsOptions& options, ExtractedCooTensors& coo_tensors) {
+    const ExtractCooTensorsOptions& options,
+    ExtractedCooTensorsPerSparseCore& coo_tensors) {
   DCHECK(!PyGILState_Check());  // Does not require external GIL.
-  tsl::profiler::TraceMe t([] { return "ExtractCooTensors"; });
+  tsl::profiler::TraceMe t(
+      [&] { return absl::StrCat("ExtractCooTensors/", table_name_); });
 
   ConstructRowPointersIfRequired();
 
-  SparseCsrInputBatchStream<int64_t,
+  SparseCsrInputBatchStream<int32_t,
                             pybind11::detail::unchecked_reference<int, 1>,
                             absl::Span<const int64_t>>
       values_stream(values_.unchecked<1>(), absl::MakeConstSpan(row_pointers_),

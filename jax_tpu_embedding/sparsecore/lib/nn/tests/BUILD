@@ -28,7 +28,7 @@ pytype_strict_contrib_test(
     env = {"JAX_PLATFORMS": "cpu"},
     deps = [
         "//jax_tpu_embedding/sparsecore/lib/core:input_preprocessing",
-        "//jax_tpu_embedding/sparsecore/lib/core:test_utils",
+        "//jax_tpu_embedding/sparsecore/lib/core/tests:test_utils",
         "//jax_tpu_embedding/sparsecore/lib/nn:embedding",
         "//jax_tpu_embedding/sparsecore/lib/nn:embedding_spec",
         pypi_requirement("absl/testing:absltest"),
@@ -117,9 +117,6 @@ pytype_strict_contrib_test(
         # TPU chip configuration,
         "--xla_sc_pack_quantization_compute=true",
     ],
-    env = {
-        "XLA_FLAGS": "--xla_dump_to=sponge",
-    },
     main = "tpu_sparse_dense_matmul_test.py",
     tags = [
         "exclusive-if-local",
@@ -147,10 +144,6 @@ pytype_strict_contrib_test(
     args = [
         # TPU chip configuration,
     ],
-    env = {
-        "XLA_FLAGS": "--xla_dump_to=sponge",
-        "JAX_TRACEBACK_FILTERING": "off",
-    },
     main = "tpu_sparse_dense_matmul_grad_test.py",
     tags = [
         "exclusive-if-local",
@@ -178,7 +171,7 @@ tpu_py_strict_test(
     ],
     deps = [
         ":test_utils",
-        "//jax_tpu_embedding/sparsecore/lib/core:test_utils",
+        "//jax_tpu_embedding/sparsecore/lib/core/tests:test_utils",
         "//jax_tpu_embedding/sparsecore/lib/nn:embedding",
         "//jax_tpu_embedding/sparsecore/lib/nn:embedding_spec",
         "//jax_tpu_embedding/sparsecore/lib/proto:embedding_spec_py_pb2",

@@ -117,26 +117,26 @@ class TableStackingTest : public ::testing::Test {
        16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16},
       {0, 9, 19, 30, 42, 55, 69, 84, 100}};
 
-  std::vector<StackedTableMetadata> stacked_table_metadata_multi_{
-      StackedTableMetadata(
-          /*name=*/"table_0",
+  std::vector<FeatureMetadataInStack> stacked_table_metadata_multi_{
+      FeatureMetadataInStack(
+          /*name=*/"feature_0",
           /*feature_index=*/0, /*max_ids_per_partition=*/16,
           /*max_unique_ids_per_partition=*/16, /*row_offset=*/0,
           /*col_offset=*/0, /*col_shift=*/0, /*batch_size=*/16),
-      StackedTableMetadata(
-          /*name=*/"table_1",
+      FeatureMetadataInStack(
+          /*name=*/"feature_1",
           /*feature_index=*/1, /*max_ids_per_partition=*/16,
           /*max_unique_ids_per_partition=*/16, /*row_offset=*/16,
           /*col_offset=*/32, /*col_shift=*/0, /*batch_size=*/16)};
 
-  std::vector<StackedTableMetadata> stacked_table_metadata_single_{
-      StackedTableMetadata(
-          /*name=*/"table_0",
+  std::vector<FeatureMetadataInStack> stacked_table_metadata_single_{
+      FeatureMetadataInStack(
+          /*name=*/"feature_0",
           /*feature_index=*/0, /*max_ids_per_partition=*/16,
           /*max_unique_ids_per_partition=*/16, /*row_offset=*/0,
           /*col_offset=*/0, /*col_shift=*/0, /*batch_size=*/8),
-      StackedTableMetadata(
-          /*name=*/"table_1",
+      FeatureMetadataInStack(
+          /*name=*/"feature_1",
           /*feature_index=*/1, /*max_ids_per_partition=*/16,
           /*max_unique_ids_per_partition=*/16, /*row_offset=*/8,
           /*col_offset=*/32, /*col_shift=*/0, /*batch_size=*/8)};
@@ -219,70 +219,18 @@ class AllReduceSyncKeyCollector : public AllReduceInterface {
 
 }  // namespace testing_utils
 
-TEST_F(TableStackingTest, MultiProcessStackingStackThenSplit) {
-  PreprocessSparseDenseMatmulInputOptions options{
-      .local_device_count = 1,
-      .global_device_count = 2,
-      .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kStackThenSplit};
-
-  ExtractedCooTensors extracted_coo_tensors =
-      internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
-          stacked_table_metadata_multi_, absl::MakeSpan(input_batches_multi_),
-          /*local_device_id=*/0, options);
-
-  EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 16);
-  ASSERT_THAT(extracted_coo_tensors.size(), Eq(24));
-  // This results in an uneven ID distribution - 8, 8, 4, 4
-
-  std::vector<CooFormat> expected_coo_tensors;
-  // Feature 0, slice 0
-  // SC 0 (4 rows, 8 ids)
-  expected_coo_tensors.push_back(CooFormat(0, 5, 1));
-  expected_coo_tensors.push_back(CooFormat(0, 18, 1));
-  expected_coo_tensors.push_back(CooFormat(1, 18, 1));
-  expected_coo_tensors.push_back(CooFormat(1, 0, 1));
-  expected_coo_tensors.push_back(CooFormat(2, 0, 1));
-  expected_coo_tensors.push_back(CooFormat(2, 20, 1));
-  expected_coo_tensors.push_back(CooFormat(3, 18, 1));
-  expected_coo_tensors.push_back(CooFormat(3, 0, 1));
-  // SC 1 (4 rows, 8 ids)
-  expected_coo_tensors.push_back(CooFormat(4, 18, 1));
-  expected_coo_tensors.push_back(CooFormat(4, 0, 1));
-  expected_coo_tensors.push_back(CooFormat(5, 0, 1));
-  expected_coo_tensors.push_back(CooFormat(5, 20, 1));
-  expected_coo_tensors.push_back(CooFormat(6, 5, 1));
-  expected_coo_tensors.push_back(CooFormat(6, 18, 1));
-  expected_coo_tensors.push_back(CooFormat(7, 18, 1));
-  expected_coo_tensors.push_back(CooFormat(7, 0, 1));
-
-  // Feature 1, slice 0
-  // SC 2 (4 rows, 4 ids)
-  expected_coo_tensors.push_back(CooFormat(8, 34, 1));
-  expected_coo_tensors.push_back(CooFormat(9, 42, 1));
-  expected_coo_tensors.push_back(CooFormat(10, 33, 1));
-  expected_coo_tensors.push_back(CooFormat(11, 41, 1));
-  // SC 3 (4 rows, 4 ids)
-  expected_coo_tensors.push_back(CooFormat(12, 35, 1));
-  expected_coo_tensors.push_back(CooFormat(13, 39, 1));
-  expected_coo_tensors.push_back(CooFormat(14, 36, 1));
-  expected_coo_tensors.push_back(CooFormat(15, 40, 1));
-
-  EXPECT_THAT(extracted_coo_tensors.ToCooVector(),
-              ElementsAreArray(expected_coo_tensors));
-}
-
 TEST_F(TableStackingTest, MultiProcessStackingSplitThenStack) {
   PreprocessSparseDenseMatmulInputOptions options{
       .local_device_count = 1,
       .global_device_count = 2,
       .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kSplitThenStack};
+  };
 
   ExtractedCooTensors extracted_coo_tensors =
       internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
           stacked_table_metadata_multi_, absl::MakeSpan(input_batches_multi_),
           /*local_device_id=*/0, options);
+  extracted_coo_tensors.BlockUntilReady();
 
   EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 16);
   ASSERT_THAT(extracted_coo_tensors.size(), Eq(24));
@@ -342,55 +290,24 @@ TEST_F(TableStackingTest, SingleProcessSingleDeviceSplitThenStack) {
       .local_device_count = 1,
       .global_device_count = 1,
       .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kSplitThenStack};
+  };
 
   ExtractedCooTensors extracted_coo_tensors =
       internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
           stacked_table_metadata_single_, absl::MakeSpan(input_batches_single_),
           /*local_device_id=*/0, options);
+  extracted_coo_tensors.BlockUntilReady();
 
   EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 16);
   ASSERT_THAT(extracted_coo_tensors.size(), Eq(16 * 17 / 2));
 
-  const int batch_size_per_sc =
-      extracted_coo_tensors.batch_size_for_device / options.num_sc_per_device;
   std::vector<int> ids_per_sc(options.num_sc_per_device, 0);
-  for (int i = 0; i < extracted_coo_tensors.size(); ++i) {
-    ids_per_sc[extracted_coo_tensors.ids[i].row_id / batch_size_per_sc]++;
+  for (int sc_id = 0; sc_id < options.num_sc_per_device; ++sc_id) {
+    ids_per_sc[sc_id] = extracted_coo_tensors.GetScSize(sc_id);
   }
 
   std::vector<int> expected_ids_per_sc = {1 + 2 + 9 + 10, 3 + 4 + 11 + 12,
                                           5 + 6 + 13 + 14, 7 + 8 + 15 + 16};
-
-  EXPECT_EQ(ids_per_sc, expected_ids_per_sc);
-}
-
-TEST_F(TableStackingTest, SingleProcessSingleDeviceStackThenSplit) {
-  PreprocessSparseDenseMatmulInputOptions options{
-      .local_device_count = 1,
-      .global_device_count = 1,
-      .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kStackThenSplit};
-
-  ExtractedCooTensors extracted_coo_tensors =
-      internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
-          stacked_table_metadata_single_, absl::MakeSpan(input_batches_single_),
-          /*local_device_id=*/0, options);
-
-  EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 16);
-  ASSERT_THAT(extracted_coo_tensors.size(), Eq(16 * 17 / 2));
-
-  const int batch_size_per_sc =
-      extracted_coo_tensors.batch_size_for_device / options.num_sc_per_device;
-  std::vector<int> ids_per_sc(options.num_sc_per_device, 0);
-  for (int i = 0; i < extracted_coo_tensors.size(); ++i) {
-    ids_per_sc[extracted_coo_tensors.ids[i].row_id / batch_size_per_sc]++;
-  }
-
-  std::vector<int> expected_ids_per_sc = {1 + 2 + 3 + 4,     //
-                                          5 + 6 + 7 + 8,     //
-                                          9 + 10 + 11 + 12,  //
-                                          13 + 14 + 15 + 16};
 
   EXPECT_EQ(ids_per_sc, expected_ids_per_sc);
 }
@@ -400,7 +317,7 @@ TEST_F(TableStackingTest, MultiChipSplitThenStack) {
       .local_device_count = 2,
       .global_device_count = 2,
       .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kSplitThenStack};
+  };
 
   std::vector<int> expected_ids_per_sc[] = {{1 + 9, 2 + 10, 3 + 11, 4 + 12},
                                             {5 + 13, 6 + 14, 7 + 15, 8 + 16}};
@@ -413,11 +330,9 @@ TEST_F(TableStackingTest, MultiChipSplitThenStack) {
             absl::MakeSpan(input_batches_single_), local_device_id, options);
     EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 8);
 
-    const int batch_size_per_sc =
-        extracted_coo_tensors.batch_size_for_device / options.num_sc_per_device;
     std::vector<int> ids_per_sc(options.num_sc_per_device, 0);
-    for (int i = 0; i < extracted_coo_tensors.size(); ++i) {
-      ids_per_sc[extracted_coo_tensors.ids[i].row_id / batch_size_per_sc]++;
+    for (int sc_id = 0; sc_id < options.num_sc_per_device; ++sc_id) {
+      ids_per_sc[sc_id] = extracted_coo_tensors.GetScSize(sc_id);
     }
 
     EXPECT_EQ(ids_per_sc, expected_ids_per_sc[local_device_id])
@@ -425,36 +340,7 @@ TEST_F(TableStackingTest, MultiChipSplitThenStack) {
   }
 }
 
-TEST_F(TableStackingTest, MultiChipStackThenSplit) {
-  PreprocessSparseDenseMatmulInputOptions options{
-      .local_device_count = 2,
-      .global_device_count = 2,
-      .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kStackThenSplit};
 
-  std::vector<int> expected_ids_per_sc[] = {{1 + 2, 3 + 4, 9 + 10, 11 + 12},
-                                            {5 + 6, 7 + 8, 13 + 14, 15 + 16}};
-
-  for (int local_device_id = 0; local_device_id < options.local_device_count;
-       ++local_device_id) {
-    ExtractedCooTensors extracted_coo_tensors =
-        internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
-            stacked_table_metadata_single_,
-            absl::MakeSpan(input_batches_single_), local_device_id, options);
-
-    EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 8);
-
-    const int batch_size_per_sc =
-        extracted_coo_tensors.batch_size_for_device / options.num_sc_per_device;
-    std::vector<int> ids_per_sc(options.num_sc_per_device, 0);
-    for (int i = 0; i < extracted_coo_tensors.size(); ++i) {
-      ids_per_sc[extracted_coo_tensors.ids[i].row_id / batch_size_per_sc]++;
-    }
-
-    EXPECT_EQ(ids_per_sc, expected_ids_per_sc[local_device_id])
-        << "local_device_id: " << local_device_id;
-  }
-}
 
 TEST_F(TableStackingTest, PreprocessInputWritesToProvidedOutputBuffers) {
   const int local_device_count = 1;
@@ -469,7 +355,6 @@ TEST_F(TableStackingTest, PreprocessInputWritesToProvidedOutputBuffers) {
       .local_device_count = local_device_count,
       .global_device_count = global_device_count,
       .num_sc_per_device = num_sc_per_device,
-      .feature_stacking_strategy = FeatureStackingStrategy::kSplitThenStack,
   };
 
   const int num_scs = num_sc_per_device * global_device_count;
@@ -479,7 +364,7 @@ TEST_F(TableStackingTest, PreprocessInputWritesToProvidedOutputBuffers) {
   const int row_pointers_size_per_device =
       row_pointers_size_per_bucket * num_buckets * num_sc_per_device;
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables;
 
   stacked_tables[stacked_table_metadata_multi_[0].name].push_back(
@@ -604,20 +489,24 @@ TEST_F(TableStackingTest, CooTensorsPerScCalculation) {
       .local_device_count = 1,
       .global_device_count = 1,
       .num_sc_per_device = 4,
-      .feature_stacking_strategy = FeatureStackingStrategy::kSplitThenStack};
+  };
 
   ExtractedCooTensors extracted_coo_tensors =
       internal::ExtractCooTensorsForAllFeaturesPerLocalDevice(
           stacked_table_metadata_single_, absl::MakeSpan(input_batches_single_),
           /*local_device_id=*/0, options);
+  extracted_coo_tensors.BlockUntilReady();
 
   EXPECT_EQ(extracted_coo_tensors.batch_size_for_device, 16);
   ASSERT_THAT(extracted_coo_tensors.size(), Eq(16 * 17 / 2));
 
-  std::vector<int> expected_coo_tensors_per_sc = {
-      1 + 2 + 9 + 10, 3 + 4 + 11 + 12, 5 + 6 + 13 + 14, 7 + 8 + 15 + 16};
-  EXPECT_EQ(extracted_coo_tensors.coo_tensors_per_sc,
-            expected_coo_tensors_per_sc);
+  std::vector<int> ids_per_sc(options.num_sc_per_device, 0);
+  for (int sc_id = 0; sc_id < options.num_sc_per_device; ++sc_id) {
+    ids_per_sc[sc_id] = extracted_coo_tensors.GetScSize(sc_id);
+  }
+  std::vector<int> expected_ids_per_sc = {1 + 2 + 9 + 10, 3 + 4 + 11 + 12,
+                                          5 + 6 + 13 + 14, 7 + 8 + 15 + 16};
+  EXPECT_EQ(ids_per_sc, expected_ids_per_sc);
 }
 
 class MinibatchingTest : public testing::TestWithParam<bool> {
@@ -702,13 +591,13 @@ INSTANTIATE_TEST_SUITE_P(
 
 class MinibatchingCountTest : public ::testing::Test {
  protected:
-  std::vector<StackedTableMetadata> stacked_table_metadata_{
-      StackedTableMetadata(
+  std::vector<FeatureMetadataInStack> stacked_table_metadata_{
+      FeatureMetadataInStack(
           /*name=*/"table_0",
           /*feature_index=*/0, /*max_ids_per_partition=*/16,
           /*max_unique_ids_per_partition=*/16, /*row_offset=*/0,
           /*col_offset=*/0, /*col_shift=*/0, /*batch_size=*/16),
-      StackedTableMetadata(
+      FeatureMetadataInStack(
           /*name=*/"table_1",
           /*feature_index=*/1, /*max_ids_per_partition=*/16,
           /*max_unique_ids_per_partition=*/16, /*row_offset=*/16,
@@ -793,7 +682,7 @@ TEST_F(MinibatchingCountTest,
                          /*global_sc_count=*/4,
                          /*local_sc_count=*/4);
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"table_0", stacked_table_metadata_}});
 
   // Act
@@ -827,7 +716,7 @@ TEST_F(MinibatchingCountTest, SingleHostMinibatchCountIsCorrectWhenRequired) {
                          /*global_sc_count=*/4,
                          /*local_sc_count=*/4);
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"table_0", stacked_table_metadata_}});
 
   // Act
@@ -847,7 +736,7 @@ TEST_F(MinibatchingCountTest, MultiHostMinibatchCountIsCorrectWhenNotRequired) {
   absl::Mutex mutex;
   std::vector<int> minibatches_per_host(kHosts, -1);
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"table_0", stacked_table_metadata_}});
 
   auto nodes = SetUpMinibatchingNodes(kHosts);
@@ -901,7 +790,7 @@ TEST_F(MinibatchingCountTest, MultiHostMinibatchCountIsCorrectWhenRequired) {
   absl::Mutex mutex;
   std::vector<int> minibatches_per_host(kHosts, -1);
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"table_0", stacked_table_metadata_}});
 
   auto input_batch_host0 =
@@ -950,7 +839,7 @@ TEST_F(MinibatchingCountTest, MultiHostMinibatchCountIsCorrectWhenOneRequires) {
   absl::Mutex mutex;
   std::vector<int> minibatches_per_host(kHosts, -1);
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"table_0", stacked_table_metadata_}});
 
   // Host 0: Requires minibatching
@@ -999,7 +888,7 @@ TEST_F(MinibatchingCountTest, MultiHostMinibatchCountIsCorrectWhenOneRequires) {
 
 TEST_F(MinibatchingCountTest, MinibatchSyncKeysAreDisjoint) {
   // Arrange
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"table_0", stacked_table_metadata_}});
 
   auto nodes = SetUpMinibatchingNodes(1);
@@ -1090,7 +979,6 @@ void RunPreprocessingOutputIsValidTest(
     absl::Span<const int> table_vocabs, int num_sc_per_device,
     int global_device_count, int max_ids_per_partition,
     int max_unique_ids_per_partition,
-    FeatureStackingStrategy feature_stacking_strategy,
     bool enable_minibatching) {
   // Max unique ids should be less than or equal to max ids.
   max_unique_ids_per_partition =
@@ -1112,10 +1000,10 @@ void RunPreprocessingOutputIsValidTest(
 
   CHECK_EQ(samples_per_table.size(), table_vocabs.size());
 
-  std::vector<StackedTableMetadata> stacked_table_metadata;
+  std::vector<FeatureMetadataInStack> stacked_table_metadata;
   int64_t current_col_offset = 0;
   for (int i = 0; i < table_vocabs.size(); ++i) {
-    stacked_table_metadata.push_back(StackedTableMetadata(
+    stacked_table_metadata.push_back(FeatureMetadataInStack(
         /*name=*/absl::StrCat("table_", i),
         /*feature_index=*/i, max_ids_per_partition,
         max_unique_ids_per_partition,
@@ -1127,7 +1015,7 @@ void RunPreprocessingOutputIsValidTest(
     current_col_offset += xla::RoundUpTo(table_vocabs[i], 8 * kNumScs);
   }
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables({{"stacked_table", stacked_table_metadata}});
 
   PreprocessSparseDenseMatmulInputOptions options{
@@ -1135,7 +1023,6 @@ void RunPreprocessingOutputIsValidTest(
       .global_device_count = kGlobalDeviceCount,
       .num_sc_per_device = num_sc_per_device,
       .allow_id_dropping = true,
-      .feature_stacking_strategy = feature_stacking_strategy,
       .enable_minibatching = enable_minibatching,
       .batch_number = 42};
 
@@ -1199,7 +1086,6 @@ void PreprocessingOutputIsValidComplex(
     absl::Span<const int> table_vocabs, int num_sc_per_device,
     int global_device_count, int max_ids_per_partition,
     int max_unique_ids_per_partition,
-    FeatureStackingStrategy feature_stacking_strategy,
     bool enable_minibatching) {
   std::vector<std::vector<std::vector<int64_t>>> samples_vector;
   std::apply(
@@ -1210,7 +1096,7 @@ void PreprocessingOutputIsValidComplex(
   RunPreprocessingOutputIsValidTest(
       samples_vector, table_vocabs, num_sc_per_device, global_device_count,
       max_ids_per_partition, max_unique_ids_per_partition,
-      feature_stacking_strategy, enable_minibatching);
+      enable_minibatching);
 }
 
 FUZZ_TEST(InputPreprocessingFuzzTest, PreprocessingOutputIsValidComplex)
@@ -1253,10 +1139,6 @@ FUZZ_TEST(InputPreprocessingFuzzTest, PreprocessingOutputIsValidComplex)
         fuzztest::InRange(1, 1024),
         // Domain for max_unique_ids_per_partition
         fuzztest::InRange(1, 1024),
-        // Domain for feature_stacking_strategy
-        fuzztest::ElementOf<FeatureStackingStrategy>(
-            {FeatureStackingStrategy::kStackThenSplit,
-             FeatureStackingStrategy::kSplitThenStack}),
         // Domain for enable_minibatching
         fuzztest::Arbitrary<bool>());
 
@@ -1265,12 +1147,11 @@ void PreprocessingOutputIsValidSimple(
     absl::Span<const int> table_vocabs, int num_sc_per_device,
     int global_device_count, int max_ids_per_partition,
     int max_unique_ids_per_partition,
-    FeatureStackingStrategy feature_stacking_strategy,
     bool enable_minibatching) {
   RunPreprocessingOutputIsValidTest(
       {samples}, table_vocabs, num_sc_per_device, global_device_count,
       max_ids_per_partition, max_unique_ids_per_partition,
-      feature_stacking_strategy, enable_minibatching);
+      enable_minibatching);
 }
 
 FUZZ_TEST(InputPreprocessingFuzzTest, PreprocessingOutputIsValidSimple)
@@ -1290,20 +1171,15 @@ FUZZ_TEST(InputPreprocessingFuzzTest, PreprocessingOutputIsValidSimple)
         fuzztest::InRange(1, 128),
         // Domain for max_unique_ids_per_partition
         fuzztest::InRange(1, 128),
-        // Domain for feature_stacking_strategy
-        fuzztest::ElementOf<FeatureStackingStrategy>(
-            {FeatureStackingStrategy::kStackThenSplit,
-             FeatureStackingStrategy::kSplitThenStack}),
         // Domain for enable_minibatching
         fuzztest::Arbitrary<bool>());
 
 void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
-                         int num_sc_per_device, int global_device_count,
-                         FeatureStackingStrategy feature_stacking_strategy) {
+                         int num_sc_per_device, int global_device_count) {
   std::vector<std::unique_ptr<AbstractInputBatch>> input_batches;
   input_batches.push_back(CreateInputBatchFromSamples(samples));
 
-  absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>
+  absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>
       stacked_tables;
 
   int observed_max_ids;
@@ -1316,7 +1192,6 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
       .global_device_count = global_device_count,
       .num_sc_per_device = num_sc_per_device,
       .allow_id_dropping = true,
-      .feature_stacking_strategy = feature_stacking_strategy,
       .enable_minibatching = false,
       .batch_number = 1};
   PreprocessSparseDenseMatmulInputOptions options_no_dropping{
@@ -1324,14 +1199,13 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
       .global_device_count = global_device_count,
       .num_sc_per_device = num_sc_per_device,
       .allow_id_dropping = false,
-      .feature_stacking_strategy = feature_stacking_strategy,
       .enable_minibatching = false,
       .batch_number = 1};
 
   // Run with large max_ids to get stats.
   {
-    std::vector<StackedTableMetadata> stacked_table_metadata;
-    stacked_table_metadata.push_back(StackedTableMetadata(
+    std::vector<FeatureMetadataInStack> stacked_table_metadata;
+    stacked_table_metadata.push_back(FeatureMetadataInStack(
         /*name=*/"table_0",
         /*feature_index=*/0, /*max_ids_per_partition=*/kInitialMaxIds,
         /*max_unique_ids_per_partition=*/kInitialMaxIds, /*row_offset=*/0,
@@ -1356,7 +1230,7 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
 
   // Run with exact stats, expect no id dropping.
   {
-    StackedTableMetadata& table_metadata =
+    FeatureMetadataInStack& table_metadata =
         stacked_tables.at("stacked_table")[0];
     table_metadata.max_ids_per_partition = std::max(1, observed_max_ids);
     table_metadata.max_unique_ids_per_partition =
@@ -1371,7 +1245,7 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
 
   // Run with reduced max_ids, expect id dropping if there were any ids.
   if (observed_max_ids > 1) {
-    StackedTableMetadata& table_metadata =
+    FeatureMetadataInStack& table_metadata =
         stacked_tables.at("stacked_table")[0];
     table_metadata.max_ids_per_partition = std::max(1, observed_max_ids - 1);
     table_metadata.max_unique_ids_per_partition =
@@ -1393,7 +1267,7 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
 
   // Run with reduced max_unique_ids, expect id dropping if there were any ids.
   if (observed_max_unique_ids > 1) {
-    StackedTableMetadata& table_metadata =
+    FeatureMetadataInStack& table_metadata =
         stacked_tables.at("stacked_table")[0];
     table_metadata.max_ids_per_partition = std::max(1, observed_max_ids);
     table_metadata.max_unique_ids_per_partition =
@@ -1416,7 +1290,7 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
   // Run with suggested_coo_buffer_size_per_device = observed buffer size.
   // Expect no id dropping.
   {
-    StackedTableMetadata& table_metadata =
+    FeatureMetadataInStack& table_metadata =
         stacked_tables.at("stacked_table")[0];
     table_metadata.max_ids_per_partition = kInitialMaxIds;
     table_metadata.max_unique_ids_per_partition = kInitialMaxIds;
@@ -1435,7 +1309,7 @@ void StatsValidationTest(std::vector<std::vector<int64_t>> samples,
   const int kDeviceCooBufferAlignment =
       TPU_VECTOR_REGISTER_ALIGNMENT_SIZE * num_sc_per_device;
   if (required_buffer_size_per_device > kDeviceCooBufferAlignment) {
-    StackedTableMetadata& table_metadata =
+    FeatureMetadataInStack& table_metadata =
         stacked_tables.at("stacked_table")[0];
     table_metadata.max_ids_per_partition = kInitialMaxIds;
     table_metadata.max_unique_ids_per_partition = kInitialMaxIds;
@@ -1462,11 +1336,7 @@ FUZZ_TEST(InputPreprocessingFuzzTest, StatsValidationTest)
         // Domain for num_sc_per_device
         fuzztest::ElementOf<int>({1, 2, 4}),
         // Domain for global_device_count
-        fuzztest::ElementOf<int>({1, 2, 4}),
-        // Domain for feature_stacking_strategy
-        fuzztest::ElementOf<FeatureStackingStrategy>(
-            {FeatureStackingStrategy::kStackThenSplit,
-             FeatureStackingStrategy::kSplitThenStack}));
+        fuzztest::ElementOf<int>({1, 2, 4}));
 
 }  // namespace
 }  // namespace jax_sc_embedding

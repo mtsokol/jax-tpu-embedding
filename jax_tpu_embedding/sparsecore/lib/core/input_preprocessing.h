@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "absl/base/nullability.h"  // from @com_google_absl
 #include "absl/container/flat_hash_map.h"  // from @com_google_absl
 #include "absl/status/statusor.h"  // from @com_google_absl
 #include "absl/types/span.h"  // from @com_google_absl
@@ -43,7 +44,7 @@ struct SparseDenseMatmulInputStats {
 
 namespace internal {
 ExtractedCooTensors ExtractCooTensorsForAllFeaturesPerLocalDevice(
-    absl::Span<const StackedTableMetadata> stacked_table_metadata,
+    absl::Span<const FeatureMetadataInStack> stacked_table_metadata,
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
     int local_device_id, const PreprocessSparseDenseMatmulInputOptions& options,
     bool has_variable_weights = false);
@@ -61,10 +62,10 @@ struct PreprocessSparseDenseMatmulOutput {
 absl::StatusOr<PreprocessSparseDenseMatmulOutput>
 PreprocessSparseDenseMatmulInput(
     absl::Span<std::unique_ptr<AbstractInputBatch>> input_batches,
-    const absl::flat_hash_map<std::string, std::vector<StackedTableMetadata>>&
+    const absl::flat_hash_map<std::string, std::vector<FeatureMetadataInStack>>&
         stacked_tables,
     const PreprocessSparseDenseMatmulInputOptions& options,
-    OutputCsrArrays* output_csr_arrays = nullptr);
+    OutputCsrArrays* absl_nullable output_csr_arrays = nullptr);
 
 }  // namespace jax_sc_embedding
 
